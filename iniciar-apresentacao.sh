@@ -293,6 +293,7 @@ if [ "$ACAO" = "auto" ] || [ "$ACAO" = "iniciar" ] || [ "$ACAO" = "up" ]; then
   if detectar_docker; then
     echo "== [Apresentação Docker/Linux] Subindo Cluster ($NOS nós BEAM) + Nginx + Painel de Métricas..."
     executar_compose up --build -d --scale chat="$NOS" --wait
+    executar_compose restart painel-metricas >/dev/null 2>&1 || true
 
     echo ">> Aguardando convergência do cluster e painel..."
     aguardar_http "http://127.0.0.1:${LB_PORT}/metrics" 30 || true

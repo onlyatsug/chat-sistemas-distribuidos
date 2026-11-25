@@ -374,6 +374,10 @@ function stopLoad() {
   loadState.starting = false;
   for (const bot of loadState.bots) bot.destroy();
   loadState.bots = [];
+  if (lastBeamMetrics?.resumo_cluster) {
+    prevClusterMsgs = lastBeamMetrics.resumo_cluster.mensagens_cluster ?? prevClusterMsgs;
+    prevClusterDeliveries = lastBeamMetrics.resumo_cluster.entregas_cluster ?? prevClusterDeliveries;
+  }
 }
 
 async function startLoad(params) {
@@ -458,7 +462,7 @@ async function pollCluster() {
     if (!res.ok) throw new Error(`HTTP ${res.status} em /metrics`);
     const data = await res.json();
 
-    // Enriquece cada nó com taxas por segundo (reduções/s e I/O KB/s)
+    // Enriquece cada nó com taxas por segundo (reduções/s e I/O KB/s) e detecção de mensagem recente
     const nextStats = new Map();
     if (Array.isArray(data.nos)) {
       for (const node of data.nos) {
@@ -466,15 +470,23 @@ async function pollCluster() {
         const red = node.atividade_vm?.reducoes ?? 0;
         const ioIn = node.atividade_vm?.io_entrada_kb ?? 0;
         const ioOut = node.atividade_vm?.io_saida_kb ?? 0;
+        const msgs = node.mensagens_no?.publicadas ?? 0;
         let redPerSec = 0;
         let ioKbPerSec = 0;
         if (prev && now > prev.ts) {
           const dt = (now - prev.ts) / 1000;
           redPerSec = Math.max(0, Math.round((red - prev.red) / dt));
           ioKbPerSec = Number(Math.max(0, (ioIn - prev.ioIn + (ioOut - prev.ioOut)) / dt).toFixed(1));
+          if (msgs > prev.msgs) {
+            lastActiveNode = node.no;
+            lastClusterMsgAt = now;
+          }
         }
-        nextStats.set(node.no, { ts: now, red, ioIn, ioOut });
+        const prevActiveAt = prev?.activeAt ?? 0;
+        const activeAt = prev && msgs > prev.msgs ? now : prevActiveAt;
+        nextStats.set(node.no, { ts: now, red, ioIn, ioOut, msgs, activeAt });
         node.taxas = { reducoes_seg: redPerSec, io_kb_seg: ioKbPerSec };
+        node.ativo_recente = now - activeAt < 3000;
       }
     }
     prevNodeStats = nextStats;
@@ -498,10 +510,11 @@ async function pollCluster() {
 }
 
 let lastTickPerf = performance.now();
-let clusterBaselineMsgs = 0;
-let clusterBaselineDeliveries = 0;
 let prevClusterMsgs = null;
 let prevClusterDeliveries = null;
+let lastActiveNode = null;
+let lastClusterMsgAt = 0;
+const humanWindow = []; // janela deslizante de 4 ticks (~2s) para mensagens manuais
 
 async function tickTelemetry() {
   await pollCluster();
@@ -517,12 +530,10 @@ async function tickTelemetry() {
   loadState.windowAcked = 0;
   loadState.windowDelivered = 0;
 
-  // Telemetria real do cluster (inclui mensagens digitadas por humanos no chat + bots)
+  // Telemetria real do cluster (captura mensagens digitadas por humanos no chat em qualquer sala!)
   const resumo = lastBeamMetrics?.resumo_cluster;
-  let clusterMsgRate = 0;
-  let clusterDelivRate = 0;
-  let clusterMsgsTotal = 0;
-  let clusterDelivTotal = 0;
+  let humanMsgRate = 0;
+  let humanDelivRate = 0;
   let serverLatencyMs = 0;
 
   if (resumo && typeof resumo.mensagens_cluster === "number") {
@@ -530,21 +541,45 @@ async function tickTelemetry() {
     const currDeliv = resumo.entregas_cluster ?? currMsgs;
     serverLatencyMs = Number(resumo.latencia_servidor_ms || 0);
 
-    if (prevClusterMsgs !== null) {
+    if (prevClusterMsgs === null) {
+      prevClusterMsgs = currMsgs;
+      prevClusterDeliveries = currDeliv;
+      if (!loadState.active && loadState.counters.confirmadas === 0 && currMsgs > 0) {
+        loadState.counters.enviadas = currMsgs;
+        loadState.counters.confirmadas = currMsgs;
+        loadState.counters.entregas = currDeliv;
+      }
+    } else {
       const deltaMsgs = Math.max(0, currMsgs - prevClusterMsgs);
       const deltaDeliv = Math.max(0, currDeliv - prevClusterDeliveries);
-      clusterMsgRate = Math.round(deltaMsgs / dtSec);
-      clusterDelivRate = Math.round(deltaDeliv / dtSec);
+      prevClusterMsgs = currMsgs;
+      prevClusterDeliveries = currDeliv;
+
+      if (!loadState.active) {
+        if (deltaMsgs > 0) {
+          loadState.counters.enviadas += deltaMsgs;
+          loadState.counters.confirmadas += deltaMsgs;
+          loadState.counters.entregas += deltaDeliv;
+          const latSample = Math.max(0.1, serverLatencyMs);
+          recordLatency(latSample);
+          recordAckLatency(latSample);
+        }
+        humanWindow.push({ msgs: deltaMsgs, deliv: deltaDeliv, dt: dtSec });
+        if (humanWindow.length > 4) humanWindow.shift();
+        const sumMsgs = humanWindow.reduce((a, x) => a + x.msgs, 0);
+        const sumDeliv = humanWindow.reduce((a, x) => a + x.deliv, 0);
+        const sumDt = Math.max(0.5, humanWindow.reduce((a, x) => a + x.dt, 0));
+        humanMsgRate = sumMsgs > 0 ? Math.max(1, Math.round(sumMsgs / sumDt)) : 0;
+        humanDelivRate = sumDeliv > 0 ? Math.max(1, Math.round(sumDeliv / sumDt)) : 0;
+      } else {
+        humanWindow.length = 0;
+      }
     }
-    prevClusterMsgs = currMsgs;
-    prevClusterDeliveries = currDeliv;
-    clusterMsgsTotal = Math.max(0, currMsgs - clusterBaselineMsgs);
-    clusterDelivTotal = Math.max(0, currDeliv - clusterBaselineDeliveries);
   }
 
-  const sentRate = Math.max(botSentRate, clusterMsgRate);
-  const ackRate = Math.max(botAckRate, clusterMsgRate);
-  const deliveryRate = Math.max(botDeliveryRate, clusterDelivRate);
+  const sentRate = loadState.active ? botSentRate : humanMsgRate;
+  const ackRate = loadState.active ? botAckRate : humanMsgRate;
+  const deliveryRate = loadState.active ? botDeliveryRate : humanDelivRate;
 
   if (sentRate > loadState.peakMsgRate) loadState.peakMsgRate = sentRate;
   if (deliveryRate > loadState.peakDeliveryRate) loadState.peakDeliveryRate = deliveryRate;
@@ -557,31 +592,12 @@ async function tickTelemetry() {
     }
   }
 
-  const botLiveLatency = computePercentiles(loadState.recentLatencies);
-  const botOverallLatency = computePercentiles(loadState.reservoirLatencies);
-  const botAckLatency = computePercentiles(loadState.recentAckLatencies);
+  const liveLatency = computePercentiles(loadState.recentLatencies);
+  const overallLatency = computePercentiles(loadState.reservoirLatencies);
+  const ackLatency = computePercentiles(loadState.recentAckLatencies);
 
-  const serverFallback = (activeNow) => ({
-    media: activeNow ? serverLatencyMs : 0,
-    p50: activeNow ? serverLatencyMs : 0,
-    p95: activeNow ? serverLatencyMs : 0,
-    p99: activeNow ? serverLatencyMs : 0,
-    max: activeNow ? serverLatencyMs : 0,
-    amostras: clusterMsgsTotal
-  });
-
-  const liveLatency = botLiveLatency.amostras > 0
-    ? botLiveLatency
-    : serverFallback(clusterMsgRate > 0);
-  const overallLatency = botOverallLatency.amostras > 0
-    ? botOverallLatency
-    : serverFallback(clusterMsgsTotal > 0);
-  const ackLatency = botAckLatency.amostras > 0
-    ? botAckLatency
-    : serverFallback(clusterMsgsTotal > 0);
-
-  const totalConfirmadas = Math.max(loadState.counters.confirmadas, clusterMsgsTotal);
-  const totalEntregas = Math.max(loadState.counters.entregas, clusterDelivTotal);
+  // Quando não há carga ativa nem mensagem nos últimos 2s, a curva ao vivo de latência volta à base 0
+  const chartLat = (loadState.active || humanMsgRate > 0) ? liveLatency : { p50: 0, p95: 0, p99: 0 };
 
   const elapsedSec = loadState.startedAt ? Math.round((Date.now() - loadState.startedAt) / 1000) : 0;
   const remainingSec =
@@ -602,6 +618,7 @@ async function tickTelemetry() {
       bots_configurados: loadState.bots.length,
       bots_online: botsOnline,
       bots_por_no: botsByNode,
+      ultimo_no_ativo: Date.now() - lastClusterMsgAt < 4000 ? lastActiveNode : null,
       tempo_decorrido_seg: elapsedSec,
       tempo_restante_seg: remainingSec,
       taxas: {
@@ -614,12 +631,7 @@ async function tickTelemetry() {
       latencia_janela_ms: liveLatency,
       latencia_acumulada_ms: overallLatency,
       latencia_ack_ms: ackLatency,
-      contadores: {
-        ...loadState.counters,
-        enviadas: Math.max(loadState.counters.enviadas, clusterMsgsTotal),
-        confirmadas: totalConfirmadas,
-        entregas: totalEntregas
-      }
+      contadores: { ...loadState.counters }
     }
   };
 
@@ -627,9 +639,9 @@ async function tickTelemetry() {
     ts: snapshot.ts,
     msgs_seg: sentRate,
     entregas_seg: deliveryRate,
-    p50: liveLatency.p50,
-    p95: liveLatency.p95,
-    p99: liveLatency.p99,
+    p50: chartLat.p50,
+    p95: chartLat.p95,
+    p99: chartLat.p99,
     sessoes_crdt: lastBeamMetrics?.resumo_cluster?.sessoes_ativas ?? botsOnline,
     processos_beam: lastBeamMetrics?.resumo_cluster?.processos_cluster ?? 0,
     memoria_mb: lastBeamMetrics?.resumo_cluster?.memoria_cluster_mb ?? 0
@@ -747,9 +759,12 @@ const server = http.createServer(async (req, res) => {
     loadState.peakDeliveryRate = 0;
     loadState.startedAt = null;
     loadState.endsAt = null;
+    lastActiveNode = null;
+    lastClusterMsgAt = 0;
+    humanWindow.length = 0;
     if (lastBeamMetrics?.resumo_cluster) {
-      clusterBaselineMsgs = lastBeamMetrics.resumo_cluster.mensagens_cluster ?? 0;
-      clusterBaselineDeliveries = lastBeamMetrics.resumo_cluster.entregas_cluster ?? 0;
+      prevClusterMsgs = lastBeamMetrics.resumo_cluster.mensagens_cluster ?? 0;
+      prevClusterDeliveries = lastBeamMetrics.resumo_cluster.entregas_cluster ?? 0;
     }
     history.length = 0;
     sendJson(res, 200, { ok: true });

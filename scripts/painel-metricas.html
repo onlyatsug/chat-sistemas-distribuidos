@@ -516,6 +516,10 @@
       padding-bottom: 7px;
       border-bottom: 1px solid var(--border-subtle);
     }
+    .node-card.node-active {
+      border-color: var(--cyan);
+      box-shadow: 0 0 0 1px var(--cyan-border) inset;
+    }
     .node-name {
       display: inline-flex;
       align-items: center;
@@ -1040,6 +1044,10 @@
         $("load-banner").innerHTML =
           `<span class="dot dot-sm dot-emerald pulse"></span>` +
           `<span class="c-emerald">${carga.iniciando ? "Conectando" : "Ativo"} (${carga.bots_online}/${carga.bots_configurados}${rest})</span>`;
+      } else if (carga.ultimo_no_ativo) {
+        $("load-banner").innerHTML =
+          `<span class="dot dot-sm dot-cyan pulse"></span>` +
+          `<span class="c-cyan">Chat ao vivo (${escapeHtml(carga.ultimo_no_ativo)})</span>`;
       } else {
         const suffix = cnt.entregas > 0 ? ` · ${fmtInt(cnt.entregas)} ent.` : "";
         $("load-banner").innerHTML =
@@ -1115,8 +1123,9 @@
         const sch = n.schedulers || {};
         const cat = n.catalogo_local || {};
         const msgsNo = n.mensagens_no || {};
+        const activeCls = n.ativo_recente ? " node-active" : "";
         return `
-          <div class="node-card mono">
+          <div class="node-card${activeCls} mono">
             <header class="node-head">
               <span class="node-name" title="${escapeHtml(n.no)}">
                 <span class="dot dot-emerald"></span>${escapeHtml(n.no)}
