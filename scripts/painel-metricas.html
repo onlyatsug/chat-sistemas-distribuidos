@@ -1114,6 +1114,7 @@
         const taxas = n.taxas || {};
         const sch = n.schedulers || {};
         const cat = n.catalogo_local || {};
+        const msgsNo = n.mensagens_no || {};
         return `
           <div class="node-card mono">
             <header class="node-head">
@@ -1132,8 +1133,8 @@
               <div><span class="k">Schedulers:</span> <span class="v">${sch.online ?? 0} <span class="k">(fila ${sch.run_queue ?? 0})</span></span></div>
               <div><span class="k">Reduções/s:</span> <span class="v">${fmtInt(taxas.reducoes_seg)}</span></div>
               <div><span class="k">Rede I/O:</span> <span class="v">${taxas.io_kb_seg ?? 0} KB/s</span></div>
-              <div><span class="k">Salas ETS:</span> <span class="v">${cat.salas_total ?? 0}</span></div>
-              <div><span class="k">Uptime:</span> <span class="v">${n.uptime_segundos ?? 0}s</span></div>
+              <div><span class="k">Msgs nó:</span> <span class="v c-emerald">${fmtInt(msgsNo.publicadas)}</span></div>
+              <div><span class="k">Salas / Up:</span> <span class="v">${cat.salas_total ?? 0} · ${n.uptime_segundos ?? 0}s</span></div>
             </div>
           </div>
         `;

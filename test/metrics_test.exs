@@ -10,9 +10,10 @@ defmodule ChatDistribuido.MetricsTest do
       socket(ChatDistribuidoWeb.UserSocket, "metricas-ana", %{})
       |> subscribe_and_join(ChatDistribuidoWeb.RoomChannel, "room:geral", %{"usuario" => "Ana"})
 
-    # Aguarda o :after_join registrar a presença CRDT
+    # Aguarda o :after_join registrar a presença CRDT e envia uma mensagem real
     assert_push("presence_state", _)
-    _ = socket
+    ref = push(socket, "new_msg", %{"texto" => "Mensagem real para telemetria"})
+    assert_reply(ref, :ok, %{id: _})
 
     conn = ChatDistribuidoWeb.Router.call(conn(:get, "/metrics"), [])
     assert conn.status == 200
@@ -24,6 +25,8 @@ defmodule ChatDistribuido.MetricsTest do
     assert body["resumo_cluster"]["total_nos"] >= 1
     assert body["resumo_cluster"]["processos_cluster"] > 0
     assert body["resumo_cluster"]["memoria_cluster_mb"] > 0
+    assert body["resumo_cluster"]["mensagens_cluster"] >= 1
+    assert body["resumo_cluster"]["entregas_cluster"] >= 1
     assert body["presenca_crdt"]["sessoes_ativas"] >= 1
 
     [node | _] = body["nos"]

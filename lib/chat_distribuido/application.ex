@@ -9,6 +9,7 @@ defmodule ChatDistribuido.Application do
       ChatDistribuidoWeb.Presence,
       ChatDistribuido.Rooms.Store.child_spec(),
       ChatDistribuido.Cluster.Discovery,
+      ChatDistribuido.Metrics,
       ChatDistribuidoWeb.Endpoint
     ]
 

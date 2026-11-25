@@ -1,8 +1,9 @@
 defmodule ChatDistribuido.Metrics do
   @moduledoc """
-  Pessoa 04: Coleta isolada de telemetria da VM Erlang/BEAM, catálogo ETS e presença CRDT
-  em todos os nós conectados do cluster.
+  Pessoa 04: Coleta isolada de telemetria da VM Erlang/BEAM, catálogo ETS, presença CRDT
+  e tráfego real de mensagens (via :telemetry do Phoenix) em todos os nós do cluster.
   """
+  use GenServer
 
   alias ChatDistribuido.Cluster.Discovery
   alias ChatDistribuido.NodeInfo
@@ -10,7 +11,64 @@ defmodule ChatDistribuido.Metrics do
 
   @dist_rooms :chat_distribuido_dist_rooms
   @local_rooms :chat_distribuido_rooms
+  @counters_table :chat_distribuido_p4_counters
+  @telemetry_handler_id "chat-distribuido-p4-channel-metrics"
   @rpc_timeout_ms 1_000
+
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  @impl true
+  def init(_opts) do
+    if not ets_exists?(@counters_table) do
+      :ets.new(@counters_table, [
+        :named_table,
+        :public,
+        :set,
+        read_concurrency: true,
+        write_concurrency: true
+      ])
+    end
+
+    :ets.insert_new(@counters_table, {:mensagens, 0})
+    :ets.insert_new(@counters_table, {:entregas, 0})
+    :ets.insert_new(@counters_table, {:duracao_us, 0})
+
+    :telemetry.detach(@telemetry_handler_id)
+
+    :telemetry.attach(
+      @telemetry_handler_id,
+      [:phoenix, :channel_handled_in],
+      &__MODULE__.handle_channel_event/4,
+      nil
+    )
+
+    {:ok, %{}}
+  end
+
+  @doc false
+  def handle_channel_event(
+        [:phoenix, :channel_handled_in],
+        %{duration: duration},
+        %{event: "new_msg", socket: %{topic: "room:" <> _ = topic}},
+        _config
+      ) do
+    if ets_exists?(@counters_table) do
+      duration_us = System.convert_time_unit(duration, :native, :microsecond)
+      deliveries = max(1, count_room_sessions(topic))
+
+      :ets.update_counter(@counters_table, :mensagens, {2, 1}, {:mensagens, 0})
+      :ets.update_counter(@counters_table, :entregas, {2, deliveries}, {:entregas, 0})
+      :ets.update_counter(@counters_table, :duracao_us, {2, duration_us}, {:duracao_us, 0})
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  def handle_channel_event(_event, _measurements, _metadata, _config), do: :ok
 
   @doc "Retorna o panorama consolidado do cluster e as métricas individuais de cada nó BEAM."
   def cluster_metrics do
@@ -37,7 +95,7 @@ defmodule ChatDistribuido.Metrics do
     }
   end
 
-  @doc "Coleta métricas locais da VM Erlang/BEAM e tabelas ETS deste nó."
+  @doc "Coleta métricas locais da VM Erlang/BEAM, tabelas ETS e contadores de mensagens deste nó."
   def local_snapshot do
     mem = :erlang.memory()
     {uptime_ms, _} = :erlang.statistics(:wall_clock)
@@ -46,6 +104,10 @@ defmodule ChatDistribuido.Metrics do
     rooms = read_rooms()
     public_count = Enum.count(rooms, &(&1.tipo == "publica"))
     private_count = length(rooms) - public_count
+
+    msgs_pub = read_counter(:mensagens)
+    msgs_deliv = read_counter(:entregas)
+    dur_us = read_counter(:duracao_us)
 
     %{
       no: NodeInfo.nome(),
@@ -75,6 +137,12 @@ defmodule ChatDistribuido.Metrics do
         reducoes: reductions,
         io_entrada_kb: Float.round(io_in / 1_024, 1),
         io_saida_kb: Float.round(io_out / 1_024, 1)
+      },
+      mensagens_no: %{
+        publicadas: msgs_pub,
+        entregas_estimadas: msgs_deliv,
+        duracao_total_us: dur_us,
+        latencia_servidor_ms: avg_ms(dur_us, msgs_pub)
       },
       catalogo_local: %{
         salas_total: length(rooms),
@@ -106,6 +174,10 @@ defmodule ChatDistribuido.Metrics do
       |> Enum.reduce(0.0, fn n, acc -> acc + n.memoria_mb.total end)
       |> Float.round(2)
 
+    total_msgs = Enum.reduce(nodes, 0, fn n, acc -> acc + n.mensagens_no.publicadas end)
+    total_deliv = Enum.reduce(nodes, 0, fn n, acc -> acc + n.mensagens_no.entregas_estimadas end)
+    total_dur_us = Enum.reduce(nodes, 0, fn n, acc -> acc + n.mensagens_no.duracao_total_us end)
+
     %{
       total_nos: length(nodes),
       nos_inacessiveis: unreachable,
@@ -115,6 +187,9 @@ defmodule ChatDistribuido.Metrics do
       memoria_cluster_mb: total_mem,
       schedulers_cluster: Enum.reduce(nodes, 0, fn n, acc -> acc + n.schedulers.online end),
       run_queue_cluster: Enum.reduce(nodes, 0, fn n, acc -> acc + n.schedulers.run_queue end),
+      mensagens_cluster: total_msgs,
+      entregas_cluster: total_deliv,
+      latencia_servidor_ms: avg_ms(total_dur_us, total_msgs),
       salas_replicadas:
         nodes |> Enum.map(& &1.catalogo_local.salas_total) |> Enum.max(fn -> 0 end)
     }
@@ -157,6 +232,26 @@ defmodule ChatDistribuido.Metrics do
       salas_ativas: Enum.sort_by(por_sala, &{-&1.online, &1.nome})
     }
   end
+
+  defp count_room_sessions(topic) do
+    topic
+    |> safe_presence_list()
+    |> Enum.reduce(0, fn {_user, %{metas: metas}}, acc -> acc + length(metas) end)
+  end
+
+  defp read_counter(key) do
+    if ets_exists?(@counters_table) do
+      case :ets.lookup(@counters_table, key) do
+        [{^key, val}] -> val
+        _ -> 0
+      end
+    else
+      0
+    end
+  end
+
+  defp avg_ms(_dur_us, 0), do: 0.0
+  defp avg_ms(dur_us, count), do: Float.round(dur_us / count / 1_000, 2)
 
   defp read_rooms do
     cond do

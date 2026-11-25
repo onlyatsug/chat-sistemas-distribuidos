@@ -498,6 +498,10 @@ async function pollCluster() {
 }
 
 let lastTickPerf = performance.now();
+let clusterBaselineMsgs = 0;
+let clusterBaselineDeliveries = 0;
+let prevClusterMsgs = null;
+let prevClusterDeliveries = null;
 
 async function tickTelemetry() {
   await pollCluster();
@@ -506,12 +510,41 @@ async function tickTelemetry() {
   const dtSec = Math.max(0.1, (nowPerf - lastTickPerf) / 1000);
   lastTickPerf = nowPerf;
 
-  const sentRate = Math.round(loadState.windowSent / dtSec);
-  const ackRate = Math.round(loadState.windowAcked / dtSec);
-  const deliveryRate = Math.round(loadState.windowDelivered / dtSec);
+  const botSentRate = Math.round(loadState.windowSent / dtSec);
+  const botAckRate = Math.round(loadState.windowAcked / dtSec);
+  const botDeliveryRate = Math.round(loadState.windowDelivered / dtSec);
   loadState.windowSent = 0;
   loadState.windowAcked = 0;
   loadState.windowDelivered = 0;
+
+  // Telemetria real do cluster (inclui mensagens digitadas por humanos no chat + bots)
+  const resumo = lastBeamMetrics?.resumo_cluster;
+  let clusterMsgRate = 0;
+  let clusterDelivRate = 0;
+  let clusterMsgsTotal = 0;
+  let clusterDelivTotal = 0;
+  let serverLatencyMs = 0;
+
+  if (resumo && typeof resumo.mensagens_cluster === "number") {
+    const currMsgs = resumo.mensagens_cluster;
+    const currDeliv = resumo.entregas_cluster ?? currMsgs;
+    serverLatencyMs = Number(resumo.latencia_servidor_ms || 0);
+
+    if (prevClusterMsgs !== null) {
+      const deltaMsgs = Math.max(0, currMsgs - prevClusterMsgs);
+      const deltaDeliv = Math.max(0, currDeliv - prevClusterDeliveries);
+      clusterMsgRate = Math.round(deltaMsgs / dtSec);
+      clusterDelivRate = Math.round(deltaDeliv / dtSec);
+    }
+    prevClusterMsgs = currMsgs;
+    prevClusterDeliveries = currDeliv;
+    clusterMsgsTotal = Math.max(0, currMsgs - clusterBaselineMsgs);
+    clusterDelivTotal = Math.max(0, currDeliv - clusterBaselineDeliveries);
+  }
+
+  const sentRate = Math.max(botSentRate, clusterMsgRate);
+  const ackRate = Math.max(botAckRate, clusterMsgRate);
+  const deliveryRate = Math.max(botDeliveryRate, clusterDelivRate);
 
   if (sentRate > loadState.peakMsgRate) loadState.peakMsgRate = sentRate;
   if (deliveryRate > loadState.peakDeliveryRate) loadState.peakDeliveryRate = deliveryRate;
@@ -524,9 +557,31 @@ async function tickTelemetry() {
     }
   }
 
-  const liveLatency = computePercentiles(loadState.recentLatencies);
-  const overallLatency = computePercentiles(loadState.reservoirLatencies);
-  const ackLatency = computePercentiles(loadState.recentAckLatencies);
+  const botLiveLatency = computePercentiles(loadState.recentLatencies);
+  const botOverallLatency = computePercentiles(loadState.reservoirLatencies);
+  const botAckLatency = computePercentiles(loadState.recentAckLatencies);
+
+  const serverFallback = (activeNow) => ({
+    media: activeNow ? serverLatencyMs : 0,
+    p50: activeNow ? serverLatencyMs : 0,
+    p95: activeNow ? serverLatencyMs : 0,
+    p99: activeNow ? serverLatencyMs : 0,
+    max: activeNow ? serverLatencyMs : 0,
+    amostras: clusterMsgsTotal
+  });
+
+  const liveLatency = botLiveLatency.amostras > 0
+    ? botLiveLatency
+    : serverFallback(clusterMsgRate > 0);
+  const overallLatency = botOverallLatency.amostras > 0
+    ? botOverallLatency
+    : serverFallback(clusterMsgsTotal > 0);
+  const ackLatency = botAckLatency.amostras > 0
+    ? botAckLatency
+    : serverFallback(clusterMsgsTotal > 0);
+
+  const totalConfirmadas = Math.max(loadState.counters.confirmadas, clusterMsgsTotal);
+  const totalEntregas = Math.max(loadState.counters.entregas, clusterDelivTotal);
 
   const elapsedSec = loadState.startedAt ? Math.round((Date.now() - loadState.startedAt) / 1000) : 0;
   const remainingSec =
@@ -559,7 +614,12 @@ async function tickTelemetry() {
       latencia_janela_ms: liveLatency,
       latencia_acumulada_ms: overallLatency,
       latencia_ack_ms: ackLatency,
-      contadores: { ...loadState.counters }
+      contadores: {
+        ...loadState.counters,
+        enviadas: Math.max(loadState.counters.enviadas, clusterMsgsTotal),
+        confirmadas: totalConfirmadas,
+        entregas: totalEntregas
+      }
     }
   };
 
@@ -687,6 +747,10 @@ const server = http.createServer(async (req, res) => {
     loadState.peakDeliveryRate = 0;
     loadState.startedAt = null;
     loadState.endsAt = null;
+    if (lastBeamMetrics?.resumo_cluster) {
+      clusterBaselineMsgs = lastBeamMetrics.resumo_cluster.mensagens_cluster ?? 0;
+      clusterBaselineDeliveries = lastBeamMetrics.resumo_cluster.entregas_cluster ?? 0;
+    }
     history.length = 0;
     sendJson(res, 200, { ok: true });
     return;
